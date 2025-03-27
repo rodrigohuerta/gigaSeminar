@@ -1,0 +1,646 @@
+---
+title: "EPI 271 Lab - Propensity Score modelling"
+authors: 'Rodrigo Huerta Gutiérrez, Marco Piccininni, Tobias Kurth'
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+---
+
+# Introduction
+
+The [Third International Stroke Trial](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2442584/) investigated the effect of Intravenous recombinant tissue plasminogen activator (rt-PA) administered within 6 hours of ischemic stroke symptoms on dependency or death measured 6 months after the intervention measured with the Oxford Handicap Score. The IST-3 collaborative group has made the [trial data available](https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(16)30414-7/fulltext), and we will use it to answer a specific research question.
+
+Although discharging patients home after acute ischemic stroke has been proposed as a potential intervention to decrease dependency or death from stroke, clinical trials do not consistently provide evidence for this intervention. In this context, we will use the IST-3 data to showcase different strategies in which propensity scores can be applied to adjust for confounding. 
+
+Please look for the **@TODO Your turn!** sections to complete the exercises. The program is pre-written so no specific R programming knowledge is required.
+
+---
+
+# Load the packages
+This part reads in the necessary R packages that are needed to run the code. 
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+
+# Load packages
+
+if (!require("pacman"))install.packages("pacman")
+
+pacman::p_load(
+  Epi,
+  haven,
+  tidyverse,
+  arsenal,
+  MatchIt,
+  cobalt,
+  rms,
+  knitr,
+  naniar,
+  survey,
+  pROC,
+  geepack,
+  samplesizeCMH,
+  rankinPlot,
+  questionr
+)
+
+
+# set working directory to source file location if working with local file
+
+## setwd("")
+```
+
+---
+
+# Read in the dataset
+This step will read in the IST3 dataset from its public source, which originally is in SAS format. 
+
+```{r}
+# Object with URL
+
+myUrl <- "https://datashare.ed.ac.uk/bitstream/10283/1931/12/datashare_aug2015.sas7bdat"
+
+# Read data from URL
+
+IST3 <- read_sas(url(myUrl))
+
+## Alternatively, download the data set file and read into R from local source
+```
+
+---
+
+# Data management
+
+```{r}
+## Selecting the study population and creating new variables
+IST3 <-IST3 %>%
+  filter((destination=="1"|destination=="2" |destination=="3"|destination=="4"|
+            destination=="5"|destination=="6")& dead7 !="1") %>%  # Excluded people who died before 7 days of hospital stay; kept people with known destinations  
+  
+  mutate(Home = ifelse(destination=="1",1,0),    # Create exposure variable, destination==1 responds the question in the 7th day format "Were they discharged to their own home?"
+         
+         DeathNotIndependent = ifelse(aliveind6 == "2",1,0),  # aliveind6 represents the Oxford Handicap Score at 6 months <=2 
+         
+         Gender = ifelse(gender == 1,1,0),
+         Independent7 = case_when(indepinadl_7==1~1,
+                                  indepinadl_7==2~0), # indepinadl_7 has missing values (coded as "40" and "20"); we set those values to be "NA" to create Independent7 (independence on day seven)
+         StrokePre = case_when(stroke_pre==1~1,
+                               stroke_pre==2~0),     # stroke_pre also has missing coded separately as categorical variables
+         
+         DiabetesPre = case_when(diabetes_pre == 1~1,
+                                 diabetes_pre == 2~0),
+         HypertensionPre = case_when(hypertension_pre == 1~1,
+                                     hypertension_pre == 2~0),
+         AtrialPre = case_when(atrialfib_rand == "1" ~ 1,
+                               atrialfib_rand == "2" ~ 0))
+         
+## Generate TotalHospitalStay, missing values created
+IST3$TotalHospitalStay <- as.numeric(IST3$genwardno + IST3$critcareno +
+  IST3$med_adno + IST3$strk_unitno)
+
+## Multimorbidity not taking into account previous stroke, missing values created
+IST3$Multimorbidity <- as.numeric(IST3$DiabetesPre + 
+  IST3$HypertensionPre + IST3$AtrialPre)
+
+## Selecting only outcome, exposure and confounding variables
+IST3 <- IST3 %>% 
+  select(DeathNotIndependent, Home, age, Multimorbidity, Gender,
+         TotalHospitalStay, nihss, StrokePre, Independent7, ohs6)
+
+## Brief evaluation of the data set (which variables are in it, how many people are in it, how many have the exposure of interest, how many the outcome, how many missing)
+summary(IST3)
+str(IST3)
+
+## Select only non-missing observations
+IST3 <- na.omit(IST3)  
+summary(IST3)
+```
+### IST3-Course data {.tabset .tabset-fade .tabset-pills}
+The dataset that we are using for this course contains the following variables. Variables that start with a capital letter are re-categorized from the original dataset. 
+
+- Home (1=Discharged home, 0=Discharged not home; intervention) 
+- DeathNotIndependent (1: Oxford Handicap Score at 6 months <= 2 (death or not independent), 0: Oxford Handicap Score at 6 months > 2 (alive and independent at 6 months); outcome)
+- age (age of participant in years at randomization)
+- Gender (1=woman, 0=man)
+- Multimorbidity (number of co-morbidities (diabetes, hypertension, atrial fibrillation))
+- TotalHospitalStay (number of days in hospital)
+- nihss (National Institutes of Health Stroke Scale score)
+- Independent7: independent at day 7
+- DiabetesPre (1=previous history of diabetes; 0=no previous history of diabetes)
+- AtrialPre (1=previous history of atrial fibrillation; 0=no previous history of atrial fibrillation)
+- HypertensionPre (1=previous history of hypertension; 0=no previous history of hypertension)
+
+
+---
+
+---
+
+# Crude association between exposure and outcome
+
+```{r}
+# Creating a table of exposure and outcome
+tableSurvival <- table(IST3$Home, IST3$DeathNotIndependent, dnn=c("Home","DeathNotIndependent"))
+
+print(myTable)
+
+# Creating table with ordinal outcome
+tableOrdinal <- table(group = IST3$Home, mRS = IST3$ohs6)
+
+```
+
+**@TODO Your turn!** Calculate the odds ratio with the table above. Remember that discharge home is our exposure and death or lack of independence is the outcome.
+
+```{r}
+grottaBar(myTable, groupName = "group", scoreName = "mRS")
+```
+
+## Logistic regression
+
+```{r}
+##Fit logistic regression model with death or lack of independence as the dependent variable and discharge destination as the only independent variable
+fit1 <- glm(DeathNotIndependent~ Home ,
+           family = binomial(link="logit"), data = IST3)
+
+summary(fit1)
+```
+
+## OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit1, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+
+---
+
+# Table 1
+
+```{r}
+# Create table 1
+tab1 <- tableby(Home ~ age + Multimorbidity + factor(Gender)+ TotalHospitalStay + nihss + factor(StrokePre) + factor(Independent7), data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3"))
+```
+
+## Table 1. Characteristics by exposure group
+
+```{r, results="asis"}
+summary(tab1, test=FALSE, total=TRUE, digits=2)
+```
+
+---
+
+# Logistic regression of exposure-outcome effect, controlling for confounding by conditioning on individual confounders
+
+```{r}
+## Fit logistic regression model with confounding variables
+fit2<-glm(DeathNotIndependent ~ Home + age + Multimorbidity + Gender + 
+            TotalHospitalStay + nihss + StrokePre + Independent7,
+            family = binomial(link="logit"),
+            data = IST3)
+
+## Provide summary of results
+summary(fit2)
+```
+
+## Adjusted OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit2, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+
+**@TODO Your turn!** Can you think about other confounding variables? What about the treatment assignment? Please check the design of the trial to define if this could introduce confounding for our research question
+
+---
+
+# Build Propensity Score model
+
+```{r}
+## Fit propensity score model
+ps_model <- glm(Home ~ age + Multimorbidity + Gender + TotalHospitalStay + 
+                   nihss + StrokePre + Independent7,
+                 family = binomial(link="logit"),
+                 data = IST3)
+
+## Summarizing PS model
+summary(ps_model)
+
+## Computing propensity score for each individual
+IST3$ps <- predict(ps_model, IST3, type = "response")
+```
+
+## Propensity scores diagnostics
+
+```{r}
+##  Look at data set to see that everyone has a PS
+head(IST3)
+
+## Look at PS (min median mean max)
+summary(IST3$ps)
+```
+
+## Distribution of the propensity score among people who were discharged home and people who were discharged elsewhere
+
+### Table
+
+```{r, results="asis"}
+tableby(Home ~ ps, data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3","range")) %>% summary(test=FALSE, total=TRUE, digits=2)
+```
+
+### Plot
+
+```{r}
+ggplot(IST3, aes(x = ps, fill = as.factor(Home))) +
+  geom_density(alpha = 0.5) +
+  xlim(0,1)
+```
+
+### C-statistic
+
+```{r}
+auc(roc(IST3$Home,IST3$ps))
+```
+
+**@TODO Your turn!** Can you think to an interpretation for the coefficients of the variables in the propensity score model?
+
+**@TODO Your turn!** What is your interpretation of the C-statistic?
+
+---
+
+# Logistic regression of exposure-outcome effect, controlling for confounding by conditioning on the propensity score
+
+```{r}
+## Fit logistic regression model with PS as independent variable
+fit3 <- glm(DeathNotIndependent ~ Home + ps,
+            family = binomial(link="logit"),
+            data = IST3)
+
+## Provide summary of results
+summary(fit3)
+```
+
+## Adjusted OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit3, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+
+## Logistic regression adjusting for the propensity score, grouped by quintiles
+
+```{r}
+IST3$ps_cat <- cut(IST3$ps, breaks=quantile(IST3$ps, probs=seq(0,1,by=0.20)), 
+                   include.lowest = T, right = T)
+table(IST3$ps_cat)
+
+## Fit logistic regression model with PS grouped by quintiles as independent variable
+fit4<-glm(DeathNotIndependent ~ Home + ps_cat,
+            family = binomial(link="logit"),
+            data = IST3)
+
+## Provide summary of results
+summary(fit4)
+```
+
+### Adjusted OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit4, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+
+---
+
+# Stratified analysis by propensity score quintiles
+
+```{r}
+##  2x2 tables of exposure-outcome in each PS quintile group
+strat_tables <- table(IST3$Home, IST3$DeathNotIndependent, IST3$ps_cat, 
+                  dnn=c("Home","DeathNotIndependent","PS_cat"))
+
+strat_tables
+
+apply(strat_tables, 3, odds.ratio)
+```
+
+## Adjusted OR, 95% CI, Mantel-Haenszel estimator
+
+```{r}
+mantelhaen.test(strat_tables)
+```
+
+**@TODO Your turn!** What happens if instead of quintile groups, we use tertile groups for the propensity score? What happen if we use decile groups for the propensity score?
+
+---
+
+# Propensity Score Matching
+
+## Create the matched cohort
+```{r}
+## Matching individuals 1:1 with nearest ps
+psMatch <- matchit(formula = Home ~ age + Multimorbidity + Gender + 
+                     TotalHospitalStay + nihss + StrokePre + Independent7,
+                   data = IST3, 
+                   distance = "logit", # Distance argument states which model will be used to calculate PS
+                   method = "nearest", # To select a matching procedure, adapt the method argument. Here we selected the greedy method, nearest neighbor matching. One can set a caliper and match with replacements as options
+                   replace = FALSE, 
+                   caliper = 0.1)
+
+summary(psMatch, un = FALSE) # un = FALSE avoids the display of the balance before matching
+
+## Love plot
+love.plot(bal.tab(psMatch, m.threshold = 0.2),
+          stats = "mean.diffs",
+          grid = TRUE,
+          stars = "raw",
+          abs = FALSE,
+          sample.names = c("Unmatched", "Matched"))
+
+## Extract matched sample
+m.data <- match.data(psMatch)
+
+## Look at the matched cohort
+head(m.data)
+```
+
+## Distribution of the propensity score among people who were discharged home and people who were discharged elsewhere in the matched cohort
+
+### Table
+
+```{r, results="asis"}
+tableby(Home ~ ps, data=m.data, numeric.stats=c("Nmiss","meansd","median","q1q3","range")) %>% summary(test=FALSE, total=TRUE, digits=2)
+```
+
+### Plot
+
+```{r}
+ggplot(m.data, aes(x = ps, fill = as.factor(Home))) +
+  geom_density(alpha = 0.5) +
+  xlim(0,1)
+```
+
+**@TODO Your turn!** Do you think the matched sample is comparable with the initial sample of this analysis? How could you investigate this and why would this be important?
+
+## Logistic regression of exposure-outcome effect, controlling for confounding by estimating the association in the matched cohort
+
+```{r}
+## Fit logistic regression model with PS as independent variable
+fit5 <- glm(DeathNotIndependent ~ Home,
+            family = binomial(link="logit"),
+            data = m.data)
+
+## Provide summary of results
+summary(fit5)
+```
+
+### Adjusted OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit5, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+
+**@TODO Your turn!** Adjust the threshold of the caliper and look at the results. What happens to the size of the matched sample?
+
+---
+
+# Inverse Probability of Treatment Weightening (IPTW)
+
+## Calculate the weights
+
+```{r}
+## Estimate unstabilized inverse probability weights
+IST3$w1 <- ifelse(IST3$Home==1, 
+                     1/IST3$ps, 
+                     1/(1-IST3$ps))
+
+head(IST3, 10)
+```
+
+## Diagnostics of weights
+
+```{r, results="asis"}
+tableby(Home ~ w1, data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3","range")) %>% summary(test=FALSE, total=TRUE, digits=2)
+```
+
+## Table 1 in the pseudo-population
+
+```{r, results="asis"}
+tableby(Home ~ age + Multimorbidity + factor(Gender)+ TotalHospitalStay + nihss + factor(StrokePre) + factor(Independent7), data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3"), weights = w1) %>% summary(test=FALSE, total=TRUE, digits=2)
+```
+
+### Balance Plot in the pseudo-population
+
+```{r}
+balance <- bal.tab(Home ~ age   + factor(Gender) + TotalHospitalStay + factor(StrokePre) + nihss + factor(Independent7), data = IST3, weights = "w1", un = TRUE)
+
+love.plot(balance, thresholds = c(m = .2),
+          stats = "mean.diffs",
+          grid = TRUE,
+          stars = "raw",
+          abs = FALSE)
+```
+
+
+
+## Logistic regression of exposure-outcome effect, controlling for confounding by estimating the association in the pseudo-population
+
+```{r}
+## Fit logistic regression model with unstabilzied weights
+fit6 <- glm(DeathNotIndependent ~ Home,
+            family = binomial(link="logit"),
+            data = IST3, weights = IST3$w1)
+
+## Provide summary of results
+summary(fit6)
+
+# or GEE for a robust variance estimator (https://remlapmot.github.io/cibookex-r/ip-weighting-and-marginal-structural-models.html)
+IST3$id <- 1:nrow(IST3)
+fit6_v2 <- geeglm(DeathNotIndependent ~ Home, data = IST3, weights = w1,
+            id = id, corstr = "independence", family = binomial)
+
+## Provide summary of results
+summary(fit6_v2)
+```
+
+### Adjusted OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit6, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+broom::tidy(fit6_v2, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+
+---
+
+# Inverse Probability of Treatment Weighting with Stabilized Weights
+
+## Calculate the stabilized weights
+
+```{r}
+## Estimate stabilized inverse probability weights
+IST3$w2 <- ifelse(IST3$Home==1, 
+                  mean(IST3$Home)/IST3$ps, 
+                  (1-mean(IST3$Home))/(1-IST3$ps))
+
+head(IST3, 10)
+```
+
+## Diagnostics of stabilzied weights
+
+```{r, results="asis"}
+tableby(Home ~ w2, data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3","range")) %>% summary(test=FALSE, total=TRUE, digits=2)
+```
+
+## Table 1 in the pseudo-population obtained from stabilzied weights
+
+```{r, results="asis"}
+tableby(Home ~ age + Multimorbidity + factor(Gender)+ TotalHospitalStay + nihss + factor(StrokePre) + factor(Independent7), data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3"), weights = w2) %>% summary(test=FALSE, total=TRUE, digits=2)
+
+tableGrotta <- tableby(Home ~ as.factor(ohs6), data=IST3, weights = w2) %>% 
+  summary(test=F, total=F, digits=1)
+
+rankin <- table(mRS = IST3$ohs6,
+                Group = IST3$Home)
+
+rankinPlot::grottaBar(rankin,
+                      groupName = "Group",
+                      scoreName = "mRS")
+
+
+rankinPlot::grottaBar(tableGrotta, groupName = )
+
+
+```
+## Adjusted Grotta Bar accounting for confounding through Inverse Probability of Treatment Weightening 
+
+```{r, echo = FALSE}
+
+tab2 <- IST3%>%
+  mutate(Home= dplyr::recode(Home, `1`= "Home dispatch", `0`="Not dispatched home"),
+         mrs = factor(ohs6, levels = c(0,1,2,3,4,5)))
+
+rankin3<- wtd.table(tab2$mrs, tab2$Home,
+                     weights = tab2$w2)
+
+
+names(dimnames(rankin3)) <- c("mRS", "Home")
+
+rankinPlot::grottaBar(rankin3, groupName = "Home",
+                      scoreName = "mRS", 
+                      printNumbers = "percentage")
+
+```
+
+
+
+## Logistic regression of exposure-outcome effect, controlling for confounding by estimating association in pseudo-population (stabilized weights)
+
+```{r}
+## Fit logistic regression model with stabilized weights
+fit7 <- glm(DeathNotIndependent ~ Home,
+            family = binomial(link="logit"),
+            data = IST3, weights = IST3$w2)
+
+## Provide summary of results
+summary(fit7)
+
+# Zou's regression gives RR instead of OR (https://journals.sagepub.com/doi/full/10.1177/0962280211427759)
+# modelZou <- geeglm(death ~ tpa, data=datab,weights= w1, id= id, corstr="exchangeable", family= poisson(link="log"))
+
+# or GEE for a robust variance estimator
+fit7_v2 <- geeglm(DeathNotIndependent ~ Home, data = IST3, weights = w2,
+            id = id, corstr = "independence", family = binomial)
+
+## Provide summary of results
+summary(fit7_v2)
+```
+
+### Adjusted OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit7, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+broom::tidy(fit7_v2, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+
+**@TODO Your turn!** Do you see any difference between this result and the one obtained with the unstabilized weights? Why is that?
+
+---
+
+# Inverse Probability of Treatment Weightening with standardized mortality ratio (SMR) Weights
+
+## Calculate the SMR weights
+
+```{r}
+## Estimate SMR inverse probability weights
+IST3$w3 <- ifelse(IST3$Home==1, 
+                  1, 
+                  IST3$ps/(1-IST3$ps))
+
+View(IST3)
+```
+
+## Diagnostics of SMR weights
+
+```{r, results="asis"}
+tableby(Home ~ w3, data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3","range")) %>% summary(test=FALSE, total=TRUE, digits=2)
+```
+
+## Table 1 in the pseudo-population obtained from SMR weights
+
+```{r, results="asis"}
+tableby(Home ~ age + Multimorbidity + factor(Gender)+ TotalHospitalStay + nihss + factor(StrokePre) + factor(Independent7), data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3"), weights = w3) %>% summary(test=FALSE, total=TRUE, digits=2)
+```
+
+## Logistic regression of the exposure-outcome effect, controlling for confounding by estimating the association in the pseudo-population (SMR weights)
+
+```{r}
+## Fit logistic regression model with SMR weights
+fit8 <- glm(DeathNotIndependent ~ Home,
+            family = binomial(link="logit"),
+            data = IST3, weights = IST3$w3)
+
+## Provide summary of results
+summary(fit8)
+
+# or GEE for a robust variance estimator
+fit8_v2 <- geeglm(DeathNotIndependent ~ Home, data = IST3, weights = w3,
+            id = id, corstr = "independence", family = binomial)
+
+## Provide summary of results
+summary(fit8_v2)
+```
+
+### Adjusted OR, 95% CI
+
+```{r, results="asis"}
+## Format estimates into tibble 
+broom::tidy(fit8, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+broom::tidy(fit8_v2, exp = T, conf.int = T) %>% knitr::kable("pipe", digits=2)
+```
+### Balance Plot in the SMR pseudo-population
+
+```{r, results="asis"}
+balance1 <- bal.tab(Home ~ age   + factor(Gender) + TotalHospitalStay + factor(StrokePre) + nihss + factor(Independent7), data = IST3, weights = "w3", un = TRUE)
+
+love.plot(balance1, thresholds = c(m = .2),
+          stats = "mean.diffs",
+          grid = TRUE,
+          stars = "raw",
+          abs = FALSE)
+```
+```{r, results="asis"}
+love.plot(Home ~ age   + factor(Gender) + TotalHospitalStay + factor(StrokePre) + nihss + factor(Independent7), data = IST3, 
+          weights = list(Matched = psMatch,
+                         IPW = "w2"),
+          var.order = "unadjusted", binary = "std",
+          abs = TRUE, colors = c("red", "blue", "darkgreen"), 
+          shapes = c("circle", "square", "triangle"),
+          line = TRUE)
+```
+
+
