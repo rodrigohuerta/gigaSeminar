@@ -1,5 +1,5 @@
 ---
-title: "EPI 271 Lab - Propensity Score modelling"
+title: "Adjusted Grotta Bars for the display of causal effects with ordinal outcomes"
 authors: 'Rodrigo Huerta Gutiérrez, Marco Piccininni, Tobias Kurth'
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
@@ -145,7 +145,7 @@ The dataset that we are using for this course contains the following variables. 
 # Creating a table of exposure and outcome
 tableSurvival <- table(IST3$Home, IST3$DeathNotIndependent, dnn=c("Home","DeathNotIndependent"))
 
-print(myTable)
+print(tableSurvival)
 
 # Creating table with ordinal outcome
 tableOrdinal <- table(group = IST3$Home, mRS = IST3$ohs6)
@@ -155,7 +155,7 @@ tableOrdinal <- table(group = IST3$Home, mRS = IST3$ohs6)
 **@TODO Your turn!** Calculate the odds ratio with the table above. Remember that discharge home is our exposure and death or lack of independence is the outcome.
 
 ```{r}
-grottaBar(myTable, groupName = "group", scoreName = "mRS")
+grottaBar(tableOrdinal, groupName = "group", scoreName = "mRS")
 ```
 
 ## Logistic regression
@@ -500,42 +500,64 @@ tableby(Home ~ w2, data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3","
 ```{r, results="asis"}
 tableby(Home ~ age + Multimorbidity + factor(Gender)+ TotalHospitalStay + nihss + factor(StrokePre) + factor(Independent7), data=IST3, numeric.stats=c("Nmiss","meansd","median","q1q3"), weights = w2) %>% summary(test=FALSE, total=TRUE, digits=2)
 
-tableGrotta <- tableby(Home ~ as.factor(ohs6), data=IST3, weights = w2) %>% 
-  summary(test=F, total=F, digits=1)
-
-rankin <- table(mRS = IST3$ohs6,
-                Group = IST3$Home)
-
-rankinPlot::grottaBar(rankin,
-                      groupName = "Group",
-                      scoreName = "mRS")
-
-
-rankinPlot::grottaBar(tableGrotta, groupName = )
+# tableGrotta <- tableby(Home ~ as.factor(ohs6), data=IST3, weights = w2) %>% 
+#   summary(test=F, total=F, digits=1)
+# 
+# rankin <- table(mRS = IST3$ohs6,
+#                 Group = IST3$Home)
+# 
+# rankinPlot::grottaBar(rankin,
+#                       groupName = "Group",
+#                       scoreName = "mRS")
+# 
+# 
+# rankinPlot::grottaBar(tableGrotta, groupName = )
 
 
 ```
-## Adjusted Grotta Bar accounting for confounding through Inverse Probability of Treatment Weightening 
+## Constructing adjusted Grotta Bar accounting for confounding through Inverse Probability of Treatment Weightening 
 
 ```{r, echo = FALSE}
-
+# Releveling variables
 tab2 <- IST3%>%
-  mutate(Home= dplyr::recode(Home, `1`= "Home dispatch", `0`="Not dispatched home"),
+  mutate(Home= dplyr::recode(Home, `1`= "Home", `0`="Not home"),
          mrs = factor(ohs6, levels = c(0,1,2,3,4,5)))
+
+# Generating table
+rankin2 <- table(tab2$ohs6, tab2$Home)
+
+# Giving names to colums in table
+names(dimnames(rankin2)) <- c("mRS", "Home")
+
+# Creating Grotta bars
+unadjustedGrotta <- rankinPlot::grottaBar(rankin2, groupName = "Home", 
+                       scoreName = "mRS",
+                       printNumbers = "percentage")
+
 
 rankin3<- wtd.table(tab2$mrs, tab2$Home,
                      weights = tab2$w2)
 
-
 names(dimnames(rankin3)) <- c("mRS", "Home")
 
-rankinPlot::grottaBar(rankin3, groupName = "Home",
+adjustedGrotta <- rankinPlot::grottaBar(rankin3, groupName = "Home",
                       scoreName = "mRS", 
                       printNumbers = "percentage")
+
+### Unadjusted Grotta Bars 
+unadjustedGrotta
+
+### Adjusted Grotta Bars
+adjustedGrotta
 
 ```
 
 
+`r unadjustedGrotta`
+
+### Adjusted Grotta Bars
+
+`r adjustedGrotta`
 
 ## Logistic regression of exposure-outcome effect, controlling for confounding by estimating association in pseudo-population (stabilized weights)
 
